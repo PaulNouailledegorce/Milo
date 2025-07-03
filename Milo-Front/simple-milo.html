@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Milo - Assistant IA Éducatif</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #10046c 0%, #1a0d8a 100%);
+            color: white;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1rem;
+            text-align: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 300;
+            margin: 0;
+        }
+
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-width: 800px;
+            margin: 0 auto;
+            width: 100%;
+            padding: 1rem;
+        }
+
+        #chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem 0;
+            margin-bottom: 1rem;
+        }
+
+        .message {
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message .avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+
+        .message.user .avatar {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        .message .content {
+            max-width: 70%;
+            padding: 0.75rem 1rem;
+            border-radius: 1rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .message.user .content {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .message img {
+            max-width: 200px;
+            max-height: 200px;
+            border-radius: 8px;
+            margin-top: 0.5rem;
+        }
+
+        .input-container {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 25px;
+            padding: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .file-preview {
+            display: none;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 0.25rem 0.5rem;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            max-width: 150px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .btn {
+            background: none;
+            border: none;
+            color: white;
+            cursor: pointer;
+            padding: 0.5rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.3s;
+            font-size: 1.2rem;
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .btn.primary {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .btn.primary:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        #text-input {
+            flex: 1;
+            background: none;
+            border: none;
+            color: white;
+            padding: 0.75rem;
+            font-size: 1rem;
+            outline: none;
+        }
+
+        #text-input::placeholder {
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .voice-controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .voice-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s;
+        }
+
+        .voice-toggle.active {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+
+        .voice-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4444;
+            transition: background-color 0.3s;
+        }
+
+        .voice-toggle.active .voice-indicator {
+            background: #44ff44;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status {
+            text-align: center;
+            padding: 1rem;
+            font-style: italic;
+            opacity: 0.8;
+        }
+
+        @media (max-width: 600px) {
+            .chat-container {
+                padding: 0.5rem;
+            }
+            
+            .message .content {
+                max-width: 85%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🧐 Milo - Assistant IA Éducatif</h1>
+    </div>
+
+    <div class="chat-container">
+        <div class="voice-controls">
+            <div class="voice-toggle" id="voice-toggle">
+                <div class="voice-indicator"></div>
+                <span id="voice-status">🎙️ Mode Discussion</span>
+            </div>
+        </div>
+
+        <div id="chat-messages">
+            <div class="message milo">
+                <div class="avatar">🧐</div>
+                <div class="content">
+                    Bonjour ! Je suis Milo, votre assistant IA éducatif. Comment puis-je vous aider aujourd'hui ?
+                </div>
+            </div>
+        </div>
+
+        <div class="input-container">
+            <input type="file" id="file-input" accept="image/*,application/pdf" style="display: none;">
+            
+            <div id="file-preview" class="file-preview">
+                <span id="file-name"></span>
+                <button class="btn" id="remove-file">×</button>
+            </div>
+
+            <button class="btn" id="upload-btn" title="Joindre un fichier">📎</button>
+            <input type="text" id="text-input" placeholder="Tapez votre message...">
+            <button class="btn primary" id="send-btn" title="Envoyer">▶️</button>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const BACKEND_URL = "http://localhost:5000";
+        const socket = io(BACKEND_URL);
+        
+        // Variables globales
+        let isVoiceMode = false;
+        let recognition = null;
+        let stagedFile = null;
+        let audioQueue = [];
+        let isAudioPlaying = false;
+
+        // Éléments DOM
+        const chatMessages = document.getElementById('chat-messages');
+        const textInput = document.getElementById('text-input');
+        const sendBtn = document.getElementById('send-btn');
+        const uploadBtn = document.getElementById('upload-btn');
+        const fileInput = document.getElementById('file-input');
+        const filePreview = document.getElementById('file-preview');
+        const fileName = document.getElementById('file-name');
+        const removeFileBtn = document.getElementById('remove-file');
+        const voiceToggle = document.getElementById('voice-toggle');
+        const voiceStatus = document.getElementById('voice-status');
+
+        // Initialisation de la reconnaissance vocale
+        if ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window) {
+            recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+            recognition.lang = "fr-FR";
+            recognition.continuous = false;
+            recognition.interimResults = false;
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                sendMessage(transcript, true);
+            };
+
+            recognition.onend = () => {
+                if (isVoiceMode) {
+                    setTimeout(() => startListening(), 1000);
+                }
+            };
+
+            recognition.onerror = (event) => {
+                console.error("Erreur reconnaissance vocale:", event.error);
+                if (event.error === 'no-speech' && isVoiceMode) {
+                    setTimeout(() => startListening(), 2000);
+                }
+            };
+        } else {
+            voiceToggle.style.display = 'none';
+        }
+
+        // Socket.IO événements
+        socket.on("connect", () => {
+            console.log("✅ Connecté à Milo");
+            addStatus("Connecté au serveur");
+        });
+
+        socket.on("text_chunk", (data) => {
+            appendToLastMessage("milo", data.text);
+        });
+
+        socket.on("audio_chunk", (data) => {
+            const audioBlob = base64ToBlob(data.audio, `audio/${data.format}`);
+            audioQueue.push(URL.createObjectURL(audioBlob));
+            if (!isAudioPlaying) {
+                playAudioQueue();
+            }
+        });
+
+        socket.on("complete", () => {
+            console.log("✅ Réponse complète");
+            if (audioQueue.length === 0 && isVoiceMode) {
+                setTimeout(() => startListening(), 1500);
+            }
+        });
+
+        socket.on("error", (error) => {
+            console.error("❌ Erreur:", error);
+            addMessage("milo", "Désolé, une erreur s'est produite.");
+        });
+
+        // Fonctions principales
+        function addMessage(role, content, file = null) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'avatar';
+            avatar.textContent = role === 'milo' ? '🧐' : '👤';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'content';
+            contentDiv.textContent = content;
+            
+            if (file && file.startsWith('data:image/')) {
+                const img = document.createElement('img');
+                img.src = file;
+                contentDiv.appendChild(img);
+            }
+            
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(contentDiv);
+            chatMessages.appendChild(messageDiv);
+            scrollToBottom();
+            
+            return contentDiv;
+        }
+
+        function appendToLastMessage(role, text) {
+            const messages = chatMessages.querySelectorAll(`.message.${role}`);
+            if (messages.length > 0) {
+                const lastContent = messages[messages.length - 1].querySelector('.content');
+                lastContent.textContent += text;
+            } else {
+                addMessage(role, text);
+            }
+            scrollToBottom();
+        }
+
+        function addStatus(message) {
+            const statusDiv = document.createElement('div');
+            statusDiv.className = 'status';
+            statusDiv.textContent = message;
+            chatMessages.appendChild(statusDiv);
+            scrollToBottom();
+            setTimeout(() => statusDiv.remove(), 3000);
+        }
+
+        function sendMessage(text, isVoice = false) {
+            if (!text.trim() && !stagedFile) return;
+
+            // Afficher le message utilisateur
+            if (stagedFile) {
+                addMessage("user", text || "Analyse ce document", stagedFile.data);
+                socket.emit("file_upload", {
+                    file: stagedFile.data,
+                    prompt: text || "Analyse ce document et décris son contenu"
+                });
+                clearStagedFile();
+            } else {
+                addMessage("user", text);
+                socket.emit("query", {
+                    messages: [{ role: "user", content: text }],
+                    use_audio: isVoice
+                });
+            }
+
+            // Préparer la réponse de Milo
+            addMessage("milo", "");
+            textInput.value = "";
+        }
+
+        function startListening() {
+            if (recognition && isVoiceMode) {
+                try {
+                    recognition.start();
+                    voiceStatus.textContent = "🎙️ Écoute en cours...";
+                } catch (error) {
+                    console.error("Erreur démarrage reconnaissance:", error);
+                }
+            }
+        }
+
+        function stopListening() {
+            if (recognition) {
+                recognition.stop();
+                voiceStatus.textContent = "🎙️ Mode Discussion";
+            }
+        }
+
+        function toggleVoiceMode() {
+            isVoiceMode = !isVoiceMode;
+            voiceToggle.classList.toggle('active', isVoiceMode);
+            
+            if (isVoiceMode) {
+                voiceStatus.textContent = "🎙️ Écoute activée";
+                startListening();
+            } else {
+                voiceStatus.textContent = "🎙️ Mode Discussion";
+                stopListening();
+            }
+        }
+
+        function handleFileUpload() {
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                stagedFile = {
+                    data: e.target.result,
+                    name: file.name,
+                    type: file.type
+                };
+                
+                fileName.textContent = file.name;
+                filePreview.style.display = 'flex';
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function clearStagedFile() {
+            stagedFile = null;
+            filePreview.style.display = 'none';
+            fileInput.value = '';
+        }
+
+        function scrollToBottom() {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function playAudioQueue() {
+            if (audioQueue.length === 0 || isAudioPlaying) return;
+            
+            isAudioPlaying = true;
+            const audioUrl = audioQueue.shift();
+            const audio = new Audio(audioUrl);
+            
+            audio.onended = () => {
+                URL.revokeObjectURL(audioUrl);
+                isAudioPlaying = false;
+                playAudioQueue();
+                
+                if (audioQueue.length === 0 && isVoiceMode) {
+                    setTimeout(() => startListening(), 500);
+                }
+            };
+            
+            audio.onerror = () => {
+                isAudioPlaying = false;
+                playAudioQueue();
+            };
+            
+            audio.play();
+        }
+
+        function base64ToBlob(base64, contentType) {
+            const byteCharacters = atob(base64);
+            const byteArrays = [];
+            
+            for (let offset = 0; offset < byteCharacters.length; offset += 512) {
+                const slice = byteCharacters.slice(offset, offset + 512);
+                const byteNumbers = new Array(slice.length);
+                for (let i = 0; i < slice.length; i++) {
+                    byteNumbers[i] = slice.charCodeAt(i);
+                }
+                byteArrays.push(new Uint8Array(byteNumbers));
+            }
+            
+            return new Blob(byteArrays, { type: contentType });
+        }
+
+        // Event listeners
+        sendBtn.addEventListener('click', () => sendMessage(textInput.value));
+        textInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage(textInput.value);
+        });
+
+        uploadBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', handleFileUpload);
+        removeFileBtn.addEventListener('click', clearStagedFile);
+        
+        voiceToggle.addEventListener('click', toggleVoiceMode);
+
+        // Auto-scroll au démarrage
+        scrollToBottom();
+    </script>
+</body>
+</html> 

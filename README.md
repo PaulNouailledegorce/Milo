@@ -35,6 +35,8 @@
 
 ### 🔹 ElevenLabs
 
+La voix fonctionne bien, l'Api vocale à juste été shut down. 
+
 - Modèle : `eleven_multilingual_v2`
 - Format audio : `mp3_44100_128`
 - Authentification : `ELEVENLABS_API_KEY` (clé dans `.env`)

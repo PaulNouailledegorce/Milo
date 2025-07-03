@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Milo - Assistant Vocal</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" type="image/png" href="assets/icons/AI-MILO-2_bleu.png">
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+    <!-- Shaders pour l'animation Three.js -->
+    <script id="vertexShader" type="x-shader/x-vertex">
+        attribute float size;
+        attribute float phase;
+        uniform float time;
+        uniform float reactivity;
+        varying vec3 vColor;
+        
+        void main() {
+            vColor = vec3(1.0, 1.0, 1.0);
+            
+            vec3 pos = position;
+            float wave = sin(time + phase) * reactivity * 10.0;
+            pos.z += wave;
+            
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            gl_PointSize = size * (300.0 / -mvPosition.z);
+        }
+    </script>
+    
+    <script id="fragmentShader" type="x-shader/x-fragment">
+        varying vec3 vColor;
+        
+        void main() {
+            vec2 center = gl_PointCoord - 0.5;
+            float dist = length(center);
+            float alpha = 1.0 - smoothstep(0.0, 0.5, dist);
+            gl_FragColor = vec4(vColor, alpha * 0.8);
+        }
+    </script>
+
+    <!-- Interface Vocale (État par défaut) -->
+    <div id="voice-interface" class="interface-container active">
+        <header class="main-header">
+            <img src="assets/icons/BURGER_blanc.png" alt="Menu" class="icon burger-icon">
+            <img src="assets/logos/MILO-BLANC.png" alt="Logo Milo" class="milo-logo-img">
+            <img src="assets/logos/ECE_LOGO.png" alt="Logo ECE" class="logo ece-logo">
+        </header>
+        <main class="voice-main">
+            <div class="animation-container">
+                <div id="milo-animation-3d"></div>
+            </div>
+            <p id="status-text">Je t'écoute...</p>
+        </main>
+
+
+        <footer class="bottom-bar">
+            <button class="icon-btn" id="voice-upload-btn">
+                <img src="assets/icons/AJOUTER_blanc.png" alt="Ajouter">
+            </button>
+            <div class="spacer"></div>
+            <button class="icon-btn" id="switch-to-text-btn">
+                <img src="assets/icons/FERMER_blanc.png" alt="Chat">
+            </button>
+        </footer>
+
+        
+    </div>
+
+    <!-- Interface Textuelle (État caché) -->
+    <div id="text-interface" class="interface-container">
+        <header class="text-header">
+            <img src="assets/icons/BURGER_blanc.png" alt="Menu" class="icon burger-icon">
+            <img src="assets/logos/MILO-BLEU.png" alt="Logo Milo" class="milo-logo-img">
+            <img src="assets/logos/ECE_LOGO.png" alt="Logo ECE" class="logo ece-logo">
+        </header>
+        <div class="text-container">
+            <div id="chat-messages" class="chat-messages">
+                <!-- Les messages du chat seront ajoutés ici par JS -->
+                 <div class="message milo">
+                    <div class="avatar"><img src="assets/icons/AI-MILO-2_bleu.png" alt="Milo"></div>
+                    <div class="text">Bonjour ! Comment je peux t'aider aujourd'hui ?</div>
+                </div>
+                <div class="message user">
+                </div>
+            </div>
+            <footer class="bottom-bar">
+                <input type="file" id="file-input" accept="image/*,application/pdf" style="display: none;">
+                <button class="icon-btn" id="text-upload-btn">
+                    <img src="assets/icons/PLUS-fond-noir.png" alt="Upload">
+                </button>
+                <div class="spacer"></div>
+                <input type="text" id="text-input" placeholder="Envoyer un message">
+                <button class="icon-btn" id="send-btn">
+                    <img src="assets/icons/SEND_BLEU.png" alt="Envoyer">
+                </button>
+                <button class="icon-btn" id="switch-to-voice-btn">
+                    <img src="assets/icons/VOCAL-fond-noir.png" alt="Retour au mode vocal">
+                </button>
+            </footer>
+        </div>
+    </div>
+    
+    <script src="milo-animation.js"></script>
+    <script src="script.js"></script>
+</body>
+</html> 

@@ -8,6 +8,8 @@ import os
 import logging
 import threading
 import time
+import io
+import fitz  # PyMuPDF
 
 from collections import deque, defaultdict
 from openai import AzureOpenAI
@@ -17,7 +19,7 @@ import re
 from elevenlabs.client import ElevenLabs
 # from elevenlabs import stream # Not needed
 
-from system_prompt import prompt
+from system_prompt2 import prompt
 
 # --- Logging, Env Vars, Flask App, CORS Setup (Same as before) ---
 logging.basicConfig(
@@ -28,10 +30,13 @@ logger = logging.getLogger(__name__)
 load_dotenv(override=True)
 app = Flask(__name__)
 #ORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:3001,http://127.0.0.1:3001,https://aid-front.baaaack.com,http://localhost:3000,http://localhost:8080').split(',')
-CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:8080').split(',')
+CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:8000,http://localhost:8080,http://127.0.0.1:8000,http://127.0.0.1:8080').split(',')
 CORS(app,
      resources={r"/*": {"origins": CORS_ORIGINS}},
      supports_credentials=True)
+
+# --- Conversation History Settings ---
+MAX_HISTORY_LENGTH = 10 # Keep the last 10 messages (5 user, 5 assistant)
 
 # --- Rate Limiting (Same as before) ---
 RATE_LIMIT = 5
@@ -47,7 +52,7 @@ def health_check(): return {"status": "healthy", "timestamp": time.time(), "vers
 # --- Socket.IO Setup (Same as before) ---
 socketio = SocketIO(
     app,
-    cors_allowed_origins=CORS_ORIGINS,
+    cors_allowed_origins="*",
     async_mode='threading',
     ping_timeout=60,
     ping_interval=25,
@@ -104,7 +109,8 @@ def handle_connect():
     active_sessions[client_id] = {
         'connected_at': time.time(), 'last_activity': time.time(),
         'processing': False, 'message_count': 0,
-        'ip_address': ip_address, 'disconnected': False
+        'ip_address': ip_address, 'disconnected': False,
+        'message_history': []
     }
     emit('connected', {'message': 'Connected to server', 'session_id': client_id})
 
@@ -114,6 +120,73 @@ def handle_disconnect(*args, **kwargs):
     logger.info(f"Client disconnected: {client_id}")
     if client_id in active_sessions:
         active_sessions[client_id]['disconnected'] = True
+
+@socketio.on('mode_change')
+def handle_mode_change(data):
+    client_id = request.sid
+    session_data = active_sessions.get(client_id)
+    
+    if not session_data:
+        logger.warning(f"Mode change from unknown client: {client_id}")
+        return
+    
+    old_mode = session_data.get('is_discussion_mode', False)
+    is_discussion_mode = bool(data.get('isDiscussionMode', False))
+    session_data['is_discussion_mode'] = is_discussion_mode
+    
+    old_mode_name = "Vocal (TTS)" if old_mode else "Texte (TTT)"
+    new_mode_name = "Vocal (TTS)" if is_discussion_mode else "Texte (TTT)"
+    
+    logger.info(f"[Client {client_id}] 🔄 CHANGEMENT DE MODE: {old_mode_name} → {new_mode_name}")
+    logger.info(f"[Client {client_id}] Session mise à jour - is_discussion_mode: {is_discussion_mode}")
+    
+    # Si on passe en mode texte, on peut interrompre un éventuel processing TTS en cours
+    if not is_discussion_mode and session_data.get('processing', False):
+        logger.info(f"[Client {client_id}] Passage en mode texte - traitement vocal potentiellement interrompu")
+    
+    # Confirmer la réception au client
+    emit('mode_change_confirmed', {
+        'newMode': new_mode_name,
+        'isDiscussionMode': is_discussion_mode
+    })
+
+@socketio.on('file_upload')
+def handle_file_upload(data):
+    client_id = request.sid
+    session_data = active_sessions.get(client_id)
+
+    if not session_data:
+        logger.warning(f"File upload from unknown client: {client_id}")
+        return emit('error', {'message': 'Session not found.'})
+    
+    if is_rate_limited(session_data['ip_address']):
+        logger.warning(f"Rate limit exceeded for file upload: IP {session_data['ip_address']}")
+        return emit('error', {'message': 'Rate limit exceeded.', 'code': 'RATE_LIMITED'})
+
+    if session_data.get('processing', False):
+        logger.warning(f"Client {client_id} sent file while busy.")
+        return emit('error', {'message': 'Already processing.'})
+
+    base64_file = data.get('file')
+    prompt_text = data.get('prompt')
+
+    if not base64_file or not prompt_text:
+        return emit('error', {'message': 'Invalid file upload format.'})
+
+    session_data.update({
+        'last_activity': time.time(),
+        'message_count': session_data['message_count'] + 1,
+        'processing': True,
+        'disconnected': False,
+    })
+
+    logger.info(f"Starting file processing for client {client_id}")
+    socketio.start_background_task(
+        process_file_and_stream_response,
+        client_id=client_id,
+        base64_file=base64_file,
+        prompt_text=prompt_text
+    )
 
 # Modified query event handler to check for Discussion Mode
 @socketio.on('query')
@@ -140,16 +213,21 @@ def handle_query(data):
         emit('error', {'message': 'Already processing.'}, to=client_id)
         return
 
-    # Store Discussion Mode in session data
+    # Store Discussion Mode in session data - Maintenir le mode si déjà actif
+    current_discussion_mode = session_data.get('is_discussion_mode', False)
+    final_discussion_mode = is_discussion_mode or current_discussion_mode
+    
     session_data.update({
         'last_activity': time.time(), 
         'message_count': session_data['message_count'] + 1, 
         'processing': True, 
         'disconnected': False,
-        'is_discussion_mode': is_discussion_mode
+        'is_discussion_mode': final_discussion_mode
     })
     
-    logger.info(f"Starting processing for client {client_id} (Discussion Mode: {is_discussion_mode})")
+    logger.info(f"Discussion Mode - Frontend: {is_discussion_mode}, Session précédente: {current_discussion_mode}, Final: {final_discussion_mode}")
+    
+    logger.info(f"Starting processing for client {client_id} (Discussion Mode: {final_discussion_mode})")
     socketio.start_background_task(
         process_query_and_stream_elevenlabs_sdk_batched_text,
         messages=messages,
@@ -182,18 +260,28 @@ def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
         return
 
     full_response_text = ""
+    user_message = messages[-1]
+    history = session_data.get('message_history', [])
 
     try:
         # --- 1. LLM Streaming and Text Accumulation ---
-        logger.info(f"[Client {client_id}] Starting LLM stream...")
-        messages.insert(0, {'role': 'system', 'content': prompt})
+        logger.info(f"[Client {client_id}] Starting LLM stream... History length: {len(history)}")
+        
+        # Injection dynamique de la balise d'état dans le système prompt
+        mode_tag = "[mode=TTS]" if is_discussion_mode else "[mode=TTT]"
+        dynamic_system_prompt = f"{mode_tag}\n{prompt}"
+        
+        messages_with_history = history + messages
+        messages_with_history.insert(0, {'role': 'system', 'content': dynamic_system_prompt})
+        
+        logger.info(f"[Client {client_id}] Mode injecté: {mode_tag}")
         completion = openai_client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT_NAME, messages=messages, stream=True, temperature=0.7, max_tokens=800,
+            model=AZURE_OPENAI_DEPLOYMENT_NAME, messages=messages_with_history, stream=True, temperature=0.7, max_tokens=800,
         )
 
         for response in completion:
-            session_data = active_sessions.get(client_id) # Check disconnect
-            if not session_data or session_data.get('disconnected'):
+            current_session = active_sessions.get(client_id)
+            if not current_session or current_session.get('disconnected'):
                 logger.warning(f"[Client {client_id}] Disconnected during LLM stream.")
                 llm_error = "Client disconnected"
                 break
@@ -209,6 +297,14 @@ def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
         if not llm_error:
              logger.info(f"[Client {client_id}] LLM stream finished.")
              is_llm_complete = True
+             
+             # --- Update history ---
+             history.append(user_message)
+             history.append({'role': 'assistant', 'content': full_response_text})
+             if len(history) > MAX_HISTORY_LENGTH:
+                 history = history[-MAX_HISTORY_LENGTH:]
+             session_data['message_history'] = history
+             logger.info(f"[Client {client_id}] History updated. New length: {len(history)}")
 
         # --- 2. TTS Generation and Audio Streaming with Buffering (ONLY if Discussion Mode is enabled) ---
         session_data = active_sessions.get(client_id) # Re-check state
@@ -334,161 +430,93 @@ def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
         else:
              logger.warning(f"Session {client_id} already removed before final cleanup.")
              
-# --- Updated Main Processing Function ---
-#ef process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
-#   """
-#   Handles LLM query, accumulates full text, then streams audio using SDK.
-#   Implements audio buffering for smoother playback.
-#   """
-#   is_llm_complete = False
-#   llm_error = None
-#   tts_error = None
-#   session_data = active_sessions.get(client_id)
-#
-#   if not session_data:
-#       logger.error(f"process_query (batch v2) called for non-existent client ID: {client_id}")
-#       return
-#   if not eleven_client:
-#       logger.error(f"[Client {client_id}] Cannot process query, ElevenLabs client missing.")
-#       if not session_data.get('disconnected'):
-#           socketio.emit('error', {'message': 'TTS service unavailable.'}, to=client_id)
-#       if client_id in active_sessions: active_sessions[client_id]['processing'] = False
-#       return
-#
-#   full_response_text = ""
-#
-#   try:
-#       # --- 1. LLM Streaming and Text Accumulation ---
-#       logger.info(f"[Client {client_id}] Starting LLM stream...")
-#       messages.insert(0, {'role': 'system', 'content': prompt})
-#       completion = openai_client.chat.completions.create(
-#           model="gpt-4.1", messages=messages, stream=True, temperature=0.7, max_tokens=800,
-#       )
-#
-#       for response in completion:
-#           session_data = active_sessions.get(client_id) # Check disconnect
-#           if not session_data or session_data.get('disconnected'):
-#               logger.warning(f"[Client {client_id}] Disconnected during LLM stream.")
-#               llm_error = "Client disconnected"
-#               break
-#
-#           if response.choices and response.choices[0].delta and response.choices[0].delta.content:
-#               llm_chunk = response.choices[0].delta.content
-#               processed_chunk = llm_chunk.replace("l'ECE", "l'E C E").replace("ECE", "E C E")
-#               processed_chunk = llm_chunk.replace("ING", "ingé")
-#               if processed_chunk:
-#                   socketio.emit('text_chunk', {'text': processed_chunk}, to=client_id)
-#                   full_response_text += processed_chunk
-#
-#       if not llm_error:
-#            logger.info(f"[Client {client_id}] LLM stream finished.")
-#            is_llm_complete = True
-#
-#       # --- 2. TTS Generation and Audio Streaming with Buffering ---
-#       session_data = active_sessions.get(client_id) # Re-check state
-#       if is_llm_complete and full_response_text.strip() and session_data and not session_data.get('disconnected'):
-#           logger.info(f"[Client {client_id}] Starting TTS generation for accumulated text...")
-#           try:
-#               # Higher quality audio format
-#               output_format = ELEVENLABS_OUTPUT_FORMAT
-#               
-#               # Add optimization options for speech synthesis
-#               audio_stream = eleven_client.text_to_speech.convert_as_stream(
-#                   text=full_response_text.strip(),
-#                   voice_id=ELEVENLABS_VOICE_ID,
-#                   model_id=ELEVENLABS_MODEL_ID,
-#                   output_format=output_format,
-#                   # Optional: You can adjust voice settings if ElevenLabs API supports it
-#                   # voice_settings={"stability": 0.5, "similarity_boost": 0.8}
-#               )
-#
-#               audio_sent = False
-#               logger.info(f"[Client {client_id}] Streaming audio back to client...")
-#               
-#               # --- Implement buffering for smoother playback ---
-#               buffer_size = 64 * 1024  # 64 KB buffer size
-#               audio_buffer = b""
-#               
-#               for audio_chunk in audio_stream:
-#                   session_data = active_sessions.get(client_id) # Check disconnect during audio stream
-#                   if not session_data or session_data.get('disconnected'):
-#                       logger.warning(f"[Client {client_id}] Disconnected during TTS audio emission.")
-#                       tts_error = "Client disconnected during audio stream"
-#                       break
-#
-#                   if isinstance(audio_chunk, bytes) and audio_chunk:
-#                       # Add to buffer instead of sending immediately
-#                       audio_buffer += audio_chunk
-#                       
-#                       # Only send when buffer reaches threshold size
-#                       if len(audio_buffer) >= buffer_size:
-#                           socketio.emit(
-#                               'audio_chunk',
-#                               {
-#                                   'audio': base64.b64encode(audio_buffer).decode('utf-8'),
-#                                   'format': output_format.split('_')[0]
-#                               },
-#                               to=client_id
-#                           )
-#                           audio_sent = True
-#                           audio_buffer = b""  # Reset buffer
-#               
-#               # Send any remaining buffered audio
-#               if audio_buffer and not tts_error:
-#                   socketio.emit(
-#                       'audio_chunk',
-#                       {
-#                           'audio': base64.b64encode(audio_buffer).decode('utf-8'),
-#                           'format': output_format.split('_')[0]
-#                       },
-#                       to=client_id
-#                   )
-#                   audio_sent = True
-#
-#               if audio_sent and not tts_error:
-#                   logger.info(f"[Client {client_id}] Finished streaming audio via SDK.")
-#               elif not audio_sent and not tts_error:
-#                   logger.warning(f"[Client {client_id}] No audio data received/sent from TTS SDK.")
-#
-#           except Exception as e:
-#               tts_error = str(e)
-#               logger.error(f"[Client {client_id}] Error during TTS streaming: {e}", exc_info=True)
-#       # --- (Handle skipping TTS logic remains same) ---
-#       elif llm_error: logger.warning(f"[Client {client_id}] Skipping TTS due to LLM error/disconnect.")
-#       elif not full_response_text.strip(): logger.warning(f"[Client {client_id}] Skipping TTS (empty LLM response).")
-#       elif session_data and session_data.get('disconnected'): logger.warning(f"[Client {client_id}] Skipping TTS (client disconnected before TTS start).")
-#
-#   except Exception as e: # Catch errors during LLM phase
-#       llm_error = str(e)
-#       logger.error(f"[Client {client_id}] Error during LLM processing: {llm_error}", exc_info=True)
-#
-#   finally:
-#       # --- (Finally block logic remains the same) ---
-#       logger.info(f"[Client {client_id}] Entering finally block (batched v2). LLM complete={is_llm_complete}, LLM Error={llm_error}, TTS Error={tts_error}")
-#       session_data = active_sessions.get(client_id)
-#       final_error = llm_error or tts_error
-#       should_send_complete = is_llm_complete and not final_error
-#
-#       if session_data and not session_data.get('disconnected'):
-#           if should_send_complete:
-#               logger.info(f"[Client {client_id}] Emitting 'complete' signal (batched v2).")
-#               socketio.emit('complete', {}, to=client_id)
-#           elif final_error:
-#               logger.error(f"[Client {client_id}] Emitting final error (batched v2): {final_error}")
-#               socketio.emit('error', {'message': f'Processing failed: {final_error}'}, to=client_id)
-#
-#       if client_id in active_sessions:
-#           active_sessions[client_id]['processing'] = False
-#           active_sessions[client_id]['last_activity'] = time.time()
-#           if active_sessions[client_id].get('disconnected'):
-#               logger.info(f"Removing disconnected session {client_id} after processing (batched v2).")
-#               try: del active_sessions[client_id]
-#               except KeyError: pass
-#           else:
-#               logger.info(f"Finished processing for client {client_id} (batched v2). Session active.")
-#       else:
-#            logger.warning(f"Session {client_id} already removed before final cleanup (batched v2).")
-#
+def process_file_and_stream_response(client_id, base64_file, prompt_text):
+    session_data = active_sessions.get(client_id)
+    if not session_data:
+        logger.error(f"process_file called for non-existent client ID: {client_id}")
+        return
+
+    history = session_data.get('message_history', [])
+    full_response_text = ""
+
+    try:
+        header, encoded_data = base64_file.split(',', 1)
+        mime_type = header.split(';')[0].split(':')[1]
+        file_bytes = base64.b64decode(encoded_data)
+        
+        content_parts = [{"type": "text", "text": prompt_text}]
+
+        if mime_type == "application/pdf":
+            logger.info(f"[Client {client_id}] Processing PDF file.")
+            pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+            for page_num in range(len(pdf_document)):
+                page = pdf_document.load_page(page_num)
+                pix = page.get_pixmap()
+                img_bytes = pix.tobytes("png")
+                base64_image = base64.b64encode(img_bytes).decode('utf-8')
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                })
+            logger.info(f"[Client {client_id}] Converted PDF to {len(pdf_document)} images.")
+        else: # Assume image
+            logger.info(f"[Client {client_id}] Processing image file of type {mime_type}.")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": base64_file}
+            })
+
+        user_message_with_file = {'role': 'user', 'content': content_parts}
+        
+        # Injection dynamique de la balise d'état dans le système prompt (pour les fichiers)
+        is_discussion_mode = bool(session_data.get('is_discussion_mode', False))
+        mode_tag = "[mode=TTS]" if is_discussion_mode else "[mode=TTT]"
+        dynamic_system_prompt = f"{mode_tag}\n{prompt}"
+        
+        # Intégrer le prompt système et l'historique
+        system_message = {'role': 'system', 'content': dynamic_system_prompt}
+        messages_with_history = [system_message] + history + [user_message_with_file]
+        
+        logger.info(f"[Client {client_id}] Mode injecté pour fichier: {mode_tag}")
+        
+        logger.info(f"[Client {client_id}] Starting LLM stream for file. History length: {len(history)}")
+        completion = openai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT_NAME,
+            messages=messages_with_history,
+            stream=True,
+            max_tokens=1024,
+        )
+
+        for response in completion:
+            current_session = active_sessions.get(client_id)
+            if not current_session or current_session.get('disconnected'):
+                logger.warning(f"[Client {client_id}] Disconnected during file stream.")
+                break
+            
+            if response.choices and response.choices[0].delta and response.choices[0].delta.content:
+                chunk = response.choices[0].delta.content
+                socketio.emit('text_chunk', {'text': chunk}, to=client_id)
+                full_response_text += chunk
+        
+        logger.info(f"[Client {client_id}] LLM stream for file finished.")
+
+        # --- Update history ---
+        history.append(user_message_with_file)
+        history.append({'role': 'assistant', 'content': full_response_text})
+        if len(history) > MAX_HISTORY_LENGTH:
+            history = history[-MAX_HISTORY_LENGTH:]
+        session_data['message_history'] = history
+        logger.info(f"[Client {client_id}] History updated after file upload. New length: {len(history)}")
+
+    except Exception as e:
+        logger.error(f"Error processing file for client {client_id}: {e}", exc_info=True)
+        if session_data and not session_data.get('disconnected'):
+            socketio.emit('error', {'message': 'Failed to process file.'}, to=client_id)
+    finally:
+        if client_id in active_sessions:
+            active_sessions[client_id]['processing'] = False
+        socketio.emit('complete', to=client_id)
+
 # --- Periodic Cleanup (Unchanged) ---
 def cleanup_stale_sessions():
     current_time = time.time()
@@ -544,7 +572,7 @@ if __name__ == "__main__":
     if not eleven_client: logger.warning("ElevenLabs client failed to initialize.")
     start_cleanup_thread()
     host = os.getenv('HOST', '0.0.0.0')
-    port = int(os.getenv('PORT', 5002))
+    port = int(os.getenv('PORT', 5000))
     logger.info(f"Starting server on {host}:{port}")
     logger.info(f"Using ElevenLabs SDK for TTS (Batched Text Input, Streamed Audio Output - v2).")
     # ... log other config ...
