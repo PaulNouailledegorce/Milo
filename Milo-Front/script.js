@@ -3,7 +3,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Configuration et variables globales ---
     const socket = io("http://localhost:5000");
     let currentMiloMessageDiv = null;
-    let audioQueue = [];
+    let audioPlaybackQueue = [];
+    let isPlayingAudio = false;
     let isDiscussionModeActive = false;
     let isWaitingForResponse = false;
     let recognition;
@@ -12,6 +13,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentAudio = null;
     let audioContext = null;
     let analyser = null;
+    let streamingComplete = false;
 
     // Mode change sera géré directement par les fonctions switchToVoice/switchToText
 
@@ -164,9 +166,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (data.audio && data.format) {
             try {
                 const blob = base64ToBlob(data.audio, `audio/${data.format}`);
-                console.log("🎵 Blob créé - taille:", blob.size, "type:", blob.type);
-                audioQueue.push(blob);
-                console.log("🎵 Audio ajouté à la queue - total chunks:", audioQueue.length);
+                audioPlaybackQueue.push(blob);
+                console.log("🎵 Audio ajouté à la queue - total chunks:", audioPlaybackQueue.length);
+                
+                // Démarrer la lecture si elle n'est pas déjà en cours
+                if (!isPlayingAudio) {
+                    playNextAudioChunk();
+                }
             } catch (error) {
                 console.error("❌ Erreur lors de la création du blob audio:", error);
             }
@@ -176,28 +182,19 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     socket.on("complete", () => {
-        console.log("✅ Réponse complète.");
-        console.log("📊 État actuel - audioQueue:", audioQueue.length, "isDiscussionModeActive:", isDiscussionModeActive, "interface:", voiceInterface.classList.contains('active') ? 'Vocal' : 'Texte');
-        
-        setMiloState('idle');
+        console.log("✅ Réponse complète du serveur (stream LLM terminé).");
+        streamingComplete = true;
         isWaitingForResponse = false;
         
-        if (audioQueue.length > 0) {
-            console.log("🔊 Lecture de l'audio en attente (" + audioQueue.length + " chunks)");
-            // Attendre un petit délai pour s'assurer que tous les chunks sont reçus
-            setTimeout(() => {
-                playAudioQueue();
-            }, 100);
-        } else {
-            console.log("📝 Pas d'audio à jouer (mode texte ou erreur)");
-            
-            if (isDiscussionModeActive && voiceInterface.classList.contains('active')) {
-                // Redémarrer automatiquement la reconnaissance vocale après la réponse
-                console.log("🔄 Redémarrage automatique de la reconnaissance après réponse (pas d'audio)");
-                setTimeout(() => {
-                    startRecognition();
-                }, 800); // Pause un peu plus longue sans audio
-            }
+        // Si aucune lecture n'est en cours et qu'il y a des chunks en attente, on lance la lecture.
+        // C'est une sécurité au cas où.
+        if (!isPlayingAudio && audioPlaybackQueue.length > 0) {
+            console.log("🔊 Lancement de la lecture audio après le signal 'complete'.");
+            playNextAudioChunk();
+        } else if (!isPlayingAudio && audioPlaybackQueue.length === 0) {
+            // S'il n'y a rien à jouer, on peut remettre en écoute.
+            setMiloState('idle');
+            restartRecognitionAfterResponse();
         }
     });
 
@@ -205,11 +202,22 @@ document.addEventListener('DOMContentLoaded', () => {
         console.error("❌ Erreur:", error);
         setMiloState('idle');
         appendMessage("milo", "Désolé, une erreur s'est produite.");
+        isWaitingForResponse = false;
+        // On s'assure de pouvoir redémarrer l'écoute même en cas d'erreur
+        restartRecognitionAfterResponse();
     });
 
     socket.on("mode_change_confirmed", (data) => {
         console.log("✅ Changement de mode confirmé par le serveur:", data.newMode);
         console.log("✅ isDiscussionMode serveur:", data.isDiscussionMode);
+        if (text || stagedFile) {
+            setMiloState('thinking');
+            currentMiloMessageDiv = null;
+            // Réinitialiser les états pour la nouvelle réponse
+            audioPlaybackQueue = [];
+            streamingComplete = false;
+            isPlayingAudio = false;
+        }
     });
 
     // --- Fonctions de gestion d'état ---
@@ -543,6 +551,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function stopCurrentAudio() {
         console.log("🛑 Arrêt de l'audio en cours");
+        isPlayingAudio = false;
         
         if (currentAudio) {
             console.log("🔇 Arrêt et suppression de l'audio actuel");
@@ -565,8 +574,8 @@ document.addEventListener('DOMContentLoaded', () => {
             currentAudio = null;
         }
         
-        // Vider la queue audio
-        audioQueue = [];
+        // Vider la nouvelle queue audio
+        audioPlaybackQueue = [];
         console.log("🗑️ Queue audio vidée");
         
         // Remettre l'état visuel à idle
@@ -586,103 +595,64 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function playAudioQueue() {
-        console.log("🔊 Tentative de lecture audio - Queue length:", audioQueue.length);
-        
-        if (audioQueue.length === 0) {
-            console.log("⚠️ Aucun audio dans la queue");
+    // --- NOUVELLE FONCTION DE LECTURE EN STREAMING ---
+    function playNextAudioChunk() {
+        if (audioPlaybackQueue.length === 0) {
+            // S'il n'y a plus rien à jouer
+            isPlayingAudio = false;
+            console.log("🏁 Fin de la lecture, queue vide.");
+
+            // Si le stream du LLM est aussi terminé, on peut passer à la suite
+            if (streamingComplete) {
+                setMiloState('idle');
+                restartRecognitionAfterResponse();
+            }
             return;
         }
-        
-        console.log("🔊 Types d'audio dans la queue:", audioQueue.map(blob => blob.type));
-        
+
+        isPlayingAudio = true;
         setMiloState('speaking');
-        
-        try {
-            const fullAudioBlob = new Blob(audioQueue, { type: audioQueue[0].type });
-            console.log("🔊 Blob audio créé - taille:", fullAudioBlob.size, "type:", fullAudioBlob.type);
-            
-            const audioUrl = URL.createObjectURL(fullAudioBlob);
-            console.log("🔊 URL audio créée:", audioUrl);
-            
-            currentAudio = new Audio(audioUrl);
-            console.log("🔊 Élément Audio créé");
-            
-            // Initialiser l'analyseur si pas encore fait
-            if (!audioContext) {
-                initElevenLabsAudioAnalysis();
-            }
-            
-            console.log("🔊 Démarrage de la lecture audio...");
-            currentAudio.play()
-                .then(() => {
-                    console.log("✅ Audio démarré avec succès");
-                })
-                .catch((error) => {
-                    console.error("❌ Erreur lors du démarrage audio:", error);
-                });
-            
-            // Démarrer l'analyse audio pour la réactivité visuelle
-            if (audioContext && analyser) {
-                analyzeElevenLabsAudio(currentAudio);
-            }
-            
-            currentAudio.onended = () => {
-                console.log("🔊 Audio terminé");
-                setMiloState('idle');
-                audioQueue = []; // Vider la queue
-                
-                // Libérer l'URL
-                URL.revokeObjectURL(audioUrl);
-                currentAudio = null;
-                
-                // Remettre la réactivité à zéro quand l'audio s'arrête
-                if (miloAnimation3D) {
-                    miloAnimation3D.updateAudioReactivity(0);
-                }
-                
-                // Redémarrer la reconnaissance vocale uniquement si on est en mode vocal actif
-                if (isDiscussionModeActive && voiceInterface.classList.contains('active')) {
-                    setTimeout(() => {
-                        console.log("🎙️ Redémarrage automatique de la reconnaissance vocale après audio");
-                        startRecognition();
-                    }, 500); // Courte pause après l'audio
-                }
-            };
-            
-            currentAudio.onerror = (error) => {
-                console.error("❌ Erreur lecture audio:", error);
-                console.error("❌ Détails currentAudio:", currentAudio ? {
-                    src: currentAudio.src,
-                    readyState: currentAudio.readyState,
-                    networkState: currentAudio.networkState,
-                    error: currentAudio.error
-                } : "currentAudio est null");
-                
-                setMiloState('idle');
-                audioQueue = [];
-                
-                // Libérer l'URL en cas d'erreur
-                URL.revokeObjectURL(audioUrl);
-                currentAudio = null;
-                
-                // Remettre la réactivité à zéro en cas d'erreur
-                if (miloAnimation3D) {
-                    miloAnimation3D.updateAudioReactivity(0);
-                }
-                
-                if (isDiscussionModeActive && voiceInterface.classList.contains('active')) {
-                    setTimeout(() => {
-                        console.log("🎙️ Redémarrage reconnaissance après erreur audio");
-                        startRecognition();
-                    }, 1000);
-                }
-            };
-            
-        } catch (error) {
-            console.error("❌ Erreur lors de la création de l'audio:", error);
-            setMiloState('idle');
-            audioQueue = [];
+
+        const blob = audioPlaybackQueue.shift(); // On prend le premier chunk
+        const audioUrl = URL.createObjectURL(blob);
+        currentAudio = new Audio(audioUrl);
+
+        console.log(`🔊 Lecture du chunk suivant... ${audioPlaybackQueue.length} restant(s).`);
+
+        if (!audioContext) {
+            initElevenLabsAudioAnalysis();
+        }
+        if (audioContext && analyser) {
+            analyzeElevenLabsAudio(currentAudio);
+        }
+
+        currentAudio.play().catch(e => {
+            console.error("❌ Erreur de lecture audio:", e);
+            // S'il y a une erreur, on passe au chunk suivant
+            playNextAudioChunk();
+        });
+
+        currentAudio.onended = () => {
+            console.log("🔊 Chunk terminé.");
+            URL.revokeObjectURL(audioUrl); // Nettoyage
+            // On lance la lecture du chunk suivant
+            playNextAudioChunk();
+        };
+
+        currentAudio.onerror = (e) => {
+            console.error("❌ Erreur sur l'élément audio:", e);
+             URL.revokeObjectURL(audioUrl); // Nettoyage
+            // On passe quand même au chunk suivant
+            playNextAudioChunk();
+        };
+    }
+
+    function restartRecognitionAfterResponse() {
+        if (isDiscussionModeActive && voiceInterface.classList.contains('active')) {
+            console.log("🔄 Redémarrage de la reconnaissance vocale après la réponse.");
+            setTimeout(() => {
+                startRecognition();
+            }, 500); // Courte pause avant de réécouter
         }
     }
 
@@ -821,7 +791,7 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log("isWaitingForResponse:", isWaitingForResponse);
         console.log("Interface active:", voiceInterface.classList.contains('active') ? 'Vocal' : 'Texte');
         console.log("Recognition disponible:", !!recognition);
-        console.log("audioQueue length:", audioQueue.length);
+        console.log("audioPlaybackQueue length:", audioPlaybackQueue.length);
         console.log("currentAudio:", currentAudio ? {
             src: currentAudio.src,
             paused: currentAudio.paused,
@@ -838,9 +808,9 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log("MiloAnimation class:", !!window.MiloAnimation);
         console.log("Container 3D:", !!document.getElementById('milo-animation-3d'));
         
-        if (audioQueue.length > 0) {
-            console.log("📊 Détails audioQueue:");
-            audioQueue.forEach((blob, index) => {
+        if (audioPlaybackQueue.length > 0) {
+            console.log("📊 Détails audioPlaybackQueue:");
+            audioPlaybackQueue.forEach((blob, index) => {
                 console.log(`  Chunk ${index}: taille=${blob.size}, type=${blob.type}`);
             });
         }
@@ -884,7 +854,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.testAudioReactivity = function(intensity = 0.5) {
         console.log("🧪 Test réactivité audio avec intensité:", intensity);
         if (miloAnimation3D) {
-            miloAnimation3D.setState('speaking');
+            setMiloState('speaking');
             miloAnimation3D.updateAudioReactivity(intensity);
             console.log("🎵 Réactivité audio mise à jour:", miloAnimation3D.audioReactivity);
             console.log("🎵 Réactivité totale:", miloAnimation3D.reactivity);
@@ -894,11 +864,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // Test de lecture audio (fonction debug)
     window.testPlayAudio = function() {
         console.log("🧪 Test de lecture audio forcée");
-        console.log("📊 audioQueue actuelle:", audioQueue.length, "chunks");
+        console.log("📊 audioPlaybackQueue actuelle:", audioPlaybackQueue.length, "chunks");
         
-        if (audioQueue.length > 0) {
+        if (audioPlaybackQueue.length > 0) {
             console.log("🔊 Tentative de lecture de la queue actuelle");
-            playAudioQueue();
+            playNextAudioChunk();
         } else {
             console.log("⚠️ Aucun audio dans la queue pour tester");
             console.log("💡 Utilisez testMessage('test', true) pour générer de l'audio");

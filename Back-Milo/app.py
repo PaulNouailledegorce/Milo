@@ -213,29 +213,28 @@ def handle_query(data):
         emit('error', {'message': 'Already processing.'}, to=client_id)
         return
 
-    # Store Discussion Mode in session data - Maintenir le mode si déjà actif
-    current_discussion_mode = session_data.get('is_discussion_mode', False)
-    final_discussion_mode = is_discussion_mode or current_discussion_mode
-    
+    # CORRECTION : La source de vérité est le mode envoyé par le client avec la requête.
+    # On met simplement à jour la session avec cette information.
     session_data.update({
         'last_activity': time.time(), 
         'message_count': session_data['message_count'] + 1, 
         'processing': True, 
         'disconnected': False,
-        'is_discussion_mode': final_discussion_mode
+        'is_discussion_mode': is_discussion_mode
     })
     
-    logger.info(f"Discussion Mode - Frontend: {is_discussion_mode}, Session précédente: {current_discussion_mode}, Final: {final_discussion_mode}")
+    logger.info(f"Discussion Mode pour cette requête: {is_discussion_mode}")
     
-    logger.info(f"Starting processing for client {client_id} (Discussion Mode: {final_discussion_mode})")
+    logger.info(f"Starting processing for client {client_id} (Discussion Mode: {is_discussion_mode})")
     socketio.start_background_task(
         process_query_and_stream_elevenlabs_sdk_batched_text,
         messages=messages,
-        client_id=client_id
+        client_id=client_id,
+        is_discussion_mode=is_discussion_mode
     )
 
 # Modified main processing function with strict Discussion Mode enforcement
-def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
+def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id, is_discussion_mode):
     """
     Handles LLM query, accumulates full text, then streams audio using SDK only if Discussion Mode is enabled.
     Implements audio buffering for smoother playback.
@@ -249,7 +248,6 @@ def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
         logger.error(f"process_query called for non-existent client ID: {client_id}")
         return
         
-    is_discussion_mode = bool(session_data.get('is_discussion_mode', False))
     logger.info(f"[Client {client_id}] Discussion Mode is {'enabled' if is_discussion_mode else 'disabled'}")
     
     if is_discussion_mode and not eleven_client:
@@ -311,8 +309,10 @@ def process_query_and_stream_elevenlabs_sdk_batched_text(messages, client_id):
         
         # Re-check Discussion Mode setting (in case it changed during LLM streaming)
         if session_data:
-            is_discussion_mode = bool(session_data.get('is_discussion_mode', False))
-        
+            current_session_mode = bool(session_data.get('is_discussion_mode', False))
+            if current_session_mode != is_discussion_mode:
+                logger.warning(f"Le mode a changé pendant le traitement ! Initial: {is_discussion_mode}, Actuel: {current_session_mode}. On continue avec le mode initial.")
+
         # STRICT CHECK: Only proceed with TTS if explicitly enabled
         if is_llm_complete and is_discussion_mode and full_response_text.strip() and session_data and not session_data.get('disconnected'):
             logger.info(f"[Client {client_id}] Starting TTS generation for accumulated text...")
